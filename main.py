@@ -15,7 +15,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', required=True)
 parser.add_argument('--train_dir', required=True)
 parser.add_argument('--batch_size', default=128, type=int)
-parser.add_argument('--lr', default=0.001, type=float)
+parser.add_argument('--lr', default=0.01, type=float)
 parser.add_argument('--maxlen', default=200, type=int)
 parser.add_argument('--hidden_units', default=50, type=int)
 parser.add_argument('--num_blocks', default=2, type=int)
@@ -41,7 +41,8 @@ if __name__ == '__main__':
     # global dataset
     dataset = data_partition(args.dataset)
 
-    [user_train, user_valid, user_test, usernum, itemnum] = dataset
+    [user_train, user_valid, user_test, usernum, itemnum, sideinfo1_train, sideinfo2_train] = dataset
+
     # num_batch = len(user_train) // args.batch_size # tail? + ((len(user_train) % args.batch_size) != 0)
     num_batch = (len(user_train) - 1) // args.batch_size + 1
     cc = 0.0
@@ -52,8 +53,8 @@ if __name__ == '__main__':
     f = open(os.path.join(args.dataset + '_' + args.train_dir, 'log.txt'), 'w')
     f.write('epoch (val_ndcg, val_hr) (test_ndcg, test_hr)\n')
     
-    sampler = WarpSampler(user_train, usernum, itemnum, batch_size=args.batch_size, maxlen=args.maxlen, n_workers=3)
-    model = SASRec(usernum, itemnum, args).to(args.device) # no ReLU activation in original SASRec implementation?
+    sampler = WarpSampler(user_train, sideinfo1_train, sideinfo2_train, usernum, itemnum, batch_size=args.batch_size, maxlen=args.maxlen, n_workers=3)
+    model = SASRec(usernum, itemnum, usernum, usernum, args).to(args.device) # no ReLU activation in original SASRec implementation?
     
     for name, param in model.named_parameters():
         try:
@@ -99,9 +100,9 @@ if __name__ == '__main__':
     for epoch in range(epoch_start_idx, args.num_epochs + 1):
         if args.inference_only: break # just to decrease identition
         for step in range(num_batch): # tqdm(range(num_batch), total=num_batch, ncols=70, leave=False, unit='b'):
-            u, seq, pos, neg = sampler.next_batch() # tuples to ndarray
-            u, seq, pos, neg = np.array(u), np.array(seq), np.array(pos), np.array(neg)
-            pos_logits, neg_logits = model(u, seq, pos, neg)
+            u, seq, pos, neg, genre1_batch, genre2_batch = sampler.next_batch() # tuples to ndarray
+            u, seq, pos, neg, genre1_batch, genre2_batch = np.array(u), np.array(seq), np.array(pos), np.array(neg), np.array(genre1_batch), np.array(genre2_batch)
+            pos_logits, neg_logits = model(u, seq, pos, neg, genre1_batch, genre2_batch)
             pos_labels, neg_labels = torch.ones(pos_logits.shape, device=args.device), torch.zeros(neg_logits.shape, device=args.device)
             # print("\neye ball check raw_logits:"); print(pos_logits); print(neg_logits) # check pos_logits > 0, neg_logits < 0
             adam_optimizer.zero_grad()
@@ -111,6 +112,7 @@ if __name__ == '__main__':
             for param in model.item_emb.parameters(): loss += args.l2_emb * torch.norm(param)
             loss.backward()
             adam_optimizer.step()
+            # print(model.sideinfo1_emb(2))
             print("loss in epoch {} iteration {}: {}".format(epoch, step, loss.item())) # expected 0.4~0.6 after init few epochs
 
         if epoch % 20 == 0:

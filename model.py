@@ -22,19 +22,25 @@ class PointWiseFeedForward(torch.nn.Module):
 # pls use the following self-made multihead attention layer
 # in case your pytorch version is below 1.16 or for other reasons
 # https://github.com/pmixer/TiSASRec.pytorch/blob/master/model.py
-
+# cyh 增加输入特征
 class SASRec(torch.nn.Module):
-    def __init__(self, user_num, item_num, args):
+    def __init__(self, user_num, item_num, sideinfo1_num, sideinfo2_num, args):
         super(SASRec, self).__init__()
 
         self.user_num = user_num
         self.item_num = item_num
+        #cyh
+        self.sideinfo1_num = sideinfo1_num
+        self.sideinfo2_num = sideinfo2_num
         self.dev = args.device
+        self.hid = args.hidden_units
 
         # TODO: loss += args.l2_emb for regularizing embedding vectors during training
         # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch
         self.item_emb = torch.nn.Embedding(self.item_num+1, args.hidden_units, padding_idx=0)
         self.pos_emb = torch.nn.Embedding(args.maxlen+1, args.hidden_units, padding_idx=0)
+        self.sideinfo1_emb = torch.nn.Embedding(self.sideinfo1_num+1, args.hidden_units, padding_idx=0)
+        self.sideinfo2_emb = torch.nn.Embedding(self.sideinfo2_num+1, args.hidden_units, padding_idx=0)
         self.emb_dropout = torch.nn.Dropout(p=args.dropout_rate)
 
         self.attention_layernorms = torch.nn.ModuleList() # to be Q for self-attention
@@ -62,7 +68,68 @@ class SASRec(torch.nn.Module):
             # self.pos_sigmoid = torch.nn.Sigmoid()
             # self.neg_sigmoid = torch.nn.Sigmoid()
 
-    def log2feats(self, log_seqs): # TODO: fp64 and int64 as default in python, trim?
+    def log2feats(self, log_seqs, sideinfo1, sideinfo2): # TODO: fp64 and int64 as default in python, trim?
+        #cyh 构造嵌入层
+        sideinfo1_embs = self.sideinfo1_emb(torch.LongTensor(sideinfo1).to(self.dev))
+        sideinfo2_embs = self.sideinfo2_emb(torch.LongTensor(sideinfo2).to(self.dev))
+        item_embs = self.item_emb(torch.LongTensor(log_seqs).to(self.dev))
+        # print('输入前特征')
+        # print(self.sideinfo1_emb(torch.LongTensor([1])))
+        #cyh 拼接
+        combined_emb = torch.cat((item_embs, sideinfo1_embs, sideinfo2_embs), dim=-1)
+        #线性映射调整维度
+        linear = torch.nn.Linear(3 * self.hid, self.hid).to(self.dev)
+        seqs = linear(combined_emb)
+
+        # seqs = self.item_emb(torch.LongTensor(log_seqs).to(self.dev))
+        seqs *= self.item_emb.embedding_dim ** 0.5
+        poss = np.tile(np.arange(1, log_seqs.shape[1] + 1), [log_seqs.shape[0], 1])
+        # TODO: directly do tensor = torch.arange(1, xxx, device='cuda') to save extra overheads
+        poss *= (log_seqs != 0)
+        seqs += self.pos_emb(torch.LongTensor(poss).to(self.dev))
+        seqs = self.emb_dropout(seqs)
+
+        #cyh 构造嵌入层
+        # sideinfo1_embs = self.sideinfo1_emb(torch.LongTensor(sideinfo1).to(self.dev))
+        # sideinfo2_embs = self.sideinfo2_emb(torch.LongTensor(sideinfo2).to(self.dev))
+
+        # sideinfo1_embs *= self.sideinfo1_emb.embedding_dim ** 0.5
+        # sideinfo1_poss = np.tile(np.arange(1, sideinfo1.shape[1] + 1), [sideinfo1.shape[0], 1])
+        # sideinfo1_poss *= (sideinfo1 != 0)
+        # sideinfo1_embs += self.pos_emb(torch.LongTensor(sideinfo1_poss).to(self.dev))
+        # sideinfo1_embs = self.emb_dropout(sideinfo1_embs)
+
+        # sideinfo2_embs *= self.sideinfo2_emb.embedding_dim ** 0.5
+        # sideinfo2_poss = np.tile(np.arange(1, sideinfo2.shape[1] + 1), [sideinfo2.shape[0], 1])
+        # sideinfo2_poss *= (sideinfo2 != 0)
+        # sideinfo2_embs += self.pos_emb(torch.LongTensor(sideinfo2_poss).to(self.dev))
+        # sideinfo2_embs = self.emb_dropout(sideinfo2_embs)
+        # #cyh 拼接
+        # combined_emb = torch.cat((seqs, sideinfo1_embs, sideinfo2_embs), dim=-1)
+        # #线性映射调整维度
+        # linear = torch.nn.Linear(3 * self.hid, self.hid).to(self.dev)
+        # seqs = linear(combined_emb)
+
+        tl = seqs.shape[1] # time dim len for enforce causality
+        attention_mask = ~torch.tril(torch.ones((tl, tl), dtype=torch.bool, device=self.dev))
+
+        for i in range(len(self.attention_layers)):
+            seqs = torch.transpose(seqs, 0, 1)
+            Q = self.attention_layernorms[i](seqs)
+            mha_outputs, _ = self.attention_layers[i](Q, seqs, seqs, 
+                                            attn_mask=attention_mask)
+                                            # need_weights=False) this arg do not work?
+            seqs = Q + mha_outputs
+            seqs = torch.transpose(seqs, 0, 1)
+
+            seqs = self.forward_layernorms[i](seqs)
+            seqs = self.forward_layers[i](seqs)
+
+        log_feats = self.last_layernorm(seqs) # (U, T, C) -> (U, -1, C)
+
+        return log_feats
+
+    def cyhlog2feats(self, log_seqs): # TODO: fp64 and int64 as default in python, trim?
         seqs = self.item_emb(torch.LongTensor(log_seqs).to(self.dev))
         seqs *= self.item_emb.embedding_dim ** 0.5
         poss = np.tile(np.arange(1, log_seqs.shape[1] + 1), [log_seqs.shape[0], 1])
@@ -90,8 +157,10 @@ class SASRec(torch.nn.Module):
 
         return log_feats
 
-    def forward(self, user_ids, log_seqs, pos_seqs, neg_seqs): # for training        
-        log_feats = self.log2feats(log_seqs) # user_ids hasn't been used yet
+    def forward(self, user_ids, log_seqs, pos_seqs, neg_seqs, sideinfo1, sideinfo2): # for training        
+        log_feats = self.log2feats(log_seqs, sideinfo1, sideinfo2) # user_ids hasn't been used yet
+        # log_feats = self.cyhlog2feats(log_seqs) # user_ids hasn't been used yet
+
 
         pos_embs = self.item_emb(torch.LongTensor(pos_seqs).to(self.dev))
         neg_embs = self.item_emb(torch.LongTensor(neg_seqs).to(self.dev))
@@ -104,8 +173,9 @@ class SASRec(torch.nn.Module):
 
         return pos_logits, neg_logits # pos_pred, neg_pred
 
-    def predict(self, user_ids, log_seqs, item_indices): # for inference
-        log_feats = self.log2feats(log_seqs) # user_ids hasn't been used yet
+    def predict(self, user_ids, log_seqs, item_indices, sideinfo1, sideinfo2): # for inference
+        log_feats = self.log2feats(log_seqs, sideinfo1, sideinfo2) # user_ids hasn't been used yet
+        # log_feats = self.cyhlog2feats(log_seqs) # user_ids hasn't been used yet
 
         final_feat = log_feats[:, -1, :] # only use last QKV classifier, a waste
 
